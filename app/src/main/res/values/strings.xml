@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">清弹</string>
+    <string name="service_description">在你选定的 App 中读取当前窗口公开的无障碍控件，识别并点击广告的跳过或关闭按钮。开屏广告（含底部角落的「跳过」）可轻触已识别控件的中心。页面内容仅在设备内临时处理。</string>
+    <item type="id" name="splash_ad" />
+    <item type="id" name="interstitial_ad" />
+    <item type="id" name="sponsored_card" />
+    <item type="id" name="ad_close" />
+</resources>
