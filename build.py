@@ -80,7 +80,9 @@ def main():
     run(javac, '-encoding', 'UTF-8', '--release', '8', '-classpath', output / 'classes',
         '-d', output / 'test-classes', *test_sources)
     test_classpath = os.pathsep.join(map(str, (output / 'classes', output / 'test-classes')))
-    for name in ('AdRulesTest', 'SplashReviewTest', 'LearningFlowTest', 'HomeLaunchTest', 'AppSelectionTest'):
+    for name in ('AdRulesTest', 'SplashReviewTest', 'LearningFlowTest', 'HomeLaunchTest', 'AppSelectionTest',
+                 'MiniProgramRulesTest', 'CampusAdRulesTest', 'CloneSafetyTest',
+                 'MiniProgramVisionTest', 'MaskBackgroundTest', 'MaskRetentionTest', 'DnsPacketTest'):
         run(java, '-cp', test_classpath, 'local.qingtap.adskip.' + name)
     run(java, '-cp', d8, 'com.android.tools.r8.D8', '--lib', platform,
         '--min-api', '26', '--output', output / 'dex', ort_classes,
@@ -124,7 +126,7 @@ def main():
     metadata = dict(package=manifest.attrib['package'], version_name=version,
                     version_code=int(manifest.attrib[android + 'versionCode']),
                     apk=apk.name, size_bytes=apk.stat().st_size, sha256=digest,
-                    tests='all 5 suites passed', device_tested=False,
+                    tests='all 12 suites passed', device_tested=False,
                     signing='local test key', build_tools=args.build_tools,
                     minimum_api=26, target_api=35)
     (output / 'build-info.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')

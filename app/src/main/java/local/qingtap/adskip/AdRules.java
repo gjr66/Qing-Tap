@@ -82,6 +82,10 @@ final class AdRules {
 
     private AdRules() {}
 
+    static boolean blocked(Node node) {
+        return (node.flags & BLOCK) != 0;
+    }
+
     static int choose(List<Node> nodes, Box viewport, boolean inlineEnabled) {
         return choose(nodes, viewport, inlineEnabled, true);
     }

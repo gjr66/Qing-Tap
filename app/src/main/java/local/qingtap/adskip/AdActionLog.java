@@ -15,7 +15,7 @@ final class AdActionLog {
     }
 
     enum State {
-        LEGACY("历史记录"), CHECKING("待核对"), CHANGED("界面已变化"),
+        LEGACY("历史记录"), CHECKING("待核对"), CHANGED("界面已变化"), MASKED("已遮挡"),
         FAILED("未关闭"), BLOCKED("已暂停"), UNKNOWN("未确认"), SKIPPED("未发起跳转");
 
         final String label;

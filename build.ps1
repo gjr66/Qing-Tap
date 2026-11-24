@@ -62,6 +62,13 @@ Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingta
 Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.LearningFlowTest')
 Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.HomeLaunchTest')
 Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.AppSelectionTest')
+Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.MiniProgramRulesTest')
+Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.CampusAdRulesTest')
+Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.CloneSafetyTest')
+Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.MiniProgramVisionTest')
+Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.MaskBackgroundTest')
+Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.MaskRetentionTest')
+Run "$jdk\java.exe" @('-cp', "$build\classes;$build\test-classes", 'local.qingtap.adskip.DnsPacketTest')
 
 $classFiles = @(Get-ChildItem -LiteralPath "$build\classes" -Filter '*.class' -Recurse | ForEach-Object FullName)
 Run "$jdk\java.exe" (@('-cp', "$tools\lib\d8.jar", 'com.android.tools.r8.D8', '--lib', $platform,

@@ -4,18 +4,15 @@ import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.accessibilityservice.GestureDescription;
 import android.app.KeyguardManager;
-import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.graphics.Path;
 import android.graphics.Point;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.hardware.HardwareBuffer;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -36,9 +33,6 @@ import java.util.function.Consumer;
 @SuppressWarnings("deprecation")
 public final class AdSkipService extends AccessibilityService {
     private static final String TENCENT_VIDEO = "com.tencent.qqlive";
-    private static final String HOME_LOG = "QingTapHome";
-    private static final String HOME_RULE = "直接进入首页";
-    private static final long HOME_CHECK_MS = 2400;
     private static final String TENCENT_SPLASH_ACTIVITY = "com.tencent.qqlive.ona.activity.SplashHomeActivity";
     private static final long TENCENT_STARTUP_MS = 4500;
     private static final int MAX_NODES = 320;
@@ -52,8 +46,12 @@ public final class AdSkipService extends AccessibilityService {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable scan = this::scanPendingWindow;
     private final Runnable probe = () -> scheduleScan(SCAN_GAP_MS);
+    // Clearing a stale accessibility click target must not cancel the next visual sample.
+    private final Runnable miniRetry = () -> scheduleScan(0);
+    private static final int MINI_PROBE_LIMIT = 14;
     private final Runnable retryProbe = () -> scheduleScan(0);
     private final Runnable repeatRescan = () -> scheduleScan(0);
+    private final Runnable maskRefresh = () -> scheduleScan(0);
     private final ClickGate<AccessibilityNodeInfo> clicks = new ClickGate<>();
     private final RepeatGuard repeatGuard = new RepeatGuard();
     private RepeatGuard.Turn repeatPrompt;
@@ -61,7 +59,8 @@ public final class AdSkipService extends AccessibilityService {
             (preferences, key) -> {
                 if (AppPrefs.PACKAGES.equals(key) || AppPrefs.INLINE_PACKAGES.equals(key)
                         || AppPrefs.ACTIVE.equals(key) || AppPrefs.SPLASH_ACTIVE.equals(key)
-                        || AppPrefs.INLINE.equals(key)) {
+                        || AppPrefs.INLINE.equals(key) || AppPrefs.MINI_PROGRAM.equals(key)
+                        || AppPrefs.CAMPUS_ADS.equals(key)) {
                     updatePackageFilter();
                 }
             };
@@ -70,6 +69,28 @@ public final class AdSkipService extends AccessibilityService {
     private AppSelection selection;
     private boolean splashActive;
     private boolean inlineActive;
+    private boolean miniActive;
+    private boolean campusActive;
+    private AdMaskController adMasks;
+    private AdRules.Box lockerCardBox;
+    private long lastWeChatEventAt;
+    private final Runnable expireLockerCard = () -> {
+        if (adMasks != null && adMasks.activeIds().contains(LightCubeCard.ID)) adMasks.clear();
+        lockerCardBox = null;
+    };
+    private String maskedSignature = "";
+    private final CampusMaskAnchors maskAnchors = new CampusMaskAnchors();
+    private LiveMiniOcr miniOcr;
+    private boolean miniBusy, miniOcrBusy, maskCaptureBusy;
+    private long lastMiniResultAt;
+    private int miniAttempts;
+    private long nextMiniAt, nextMaskAt, miniObservedAt;
+    private MiniProgramVision.Target miniObserved;
+    private String miniObservedSignature;
+    private long lockerUntil;
+    private long modalSeenAt;
+    private boolean modalActed;
+    private String lockerLaunchSignature;
     private KeyguardManager keyguard;
     private PowerManager power;
     private String requestedPackage;
@@ -95,16 +116,6 @@ public final class AdSkipService extends AccessibilityService {
     private AdFeedback feedback;
     private AdActionLog actionLog;
     private WindowCloseTrace closeTrace;
-    private final HomeLaunch homeLaunch = new HomeLaunch();
-    private HomeLaunch.Discovery homeDiscovery;
-    private HomeEntryCheck homeEntryCheck;
-    private int lastHomeLogWindow = -1;
-    private String lastHomeLogPackage = "";
-    private final Runnable homeCheckTimeout = () -> finishHomeCheck(AdActionLog.State.UNKNOWN,
-            "已发送首页请求，等待后仍未观察到可确认的首页");
-    private String launcherPackage = "";
-    private String[] protectedPackages;
-    private boolean desktopWatching;
     private TaughtTargets taught;
     private int taughtGeneration;
     private int taughtAttempts;
@@ -154,10 +165,7 @@ public final class AdSkipService extends AccessibilityService {
     private int visionWindowId = -1;
     private double visionX;
     private double visionY;
-    private static Runnable memoryClear;
-    private static Runnable hintClear;
-    private static Runnable feedbackClear;
-    private static java.util.function.Consumer<String> forgetHook;
+    private final MiniScope miniScope = new MiniScope();
 
     // Forgetting one row must also stop the click: remove every record of that package and activity
     // across all four stores.
@@ -172,8 +180,11 @@ public final class AdSkipService extends AccessibilityService {
     }
 
     static void forget(String signature) {
-        java.util.function.Consumer<String> hook = forgetHook;
-        if (hook != null) hook.accept(signature);
+        AdSkipService service = connected;
+        if (service == null) return;
+        if (service.memory != null) service.memory.remove(signature);
+        if (service.hints != null) service.hints.remove(signature);
+        if (service.feedback != null) service.feedback.forget(signature);
     }
 
     static void clearTaught() {
@@ -182,17 +193,16 @@ public final class AdSkipService extends AccessibilityService {
     }
 
     static void clearFeedback() {
-        Runnable hook = feedbackClear;
-        if (hook != null) hook.run();
+        AdSkipService service = connected;
+        if (service != null && service.feedback != null) service.feedback.clear();
     }
 
     static void clearLearned() {
-        Runnable memory = memoryClear;
-        if (memory != null) memory.run();
-        Runnable hints = hintClear;
-        if (hints != null) hints.run();
-        Runnable feedbackHook = feedbackClear;
-        if (feedbackHook != null) feedbackHook.run();
+        AdSkipService service = connected;
+        if (service == null) return;
+        if (service.memory != null) service.memory.clear();
+        if (service.hints != null) service.hints.clear();
+        if (service.feedback != null) service.feedback.clear();
     }
 
     @Override protected void onServiceConnected() {
@@ -209,7 +219,6 @@ public final class AdSkipService extends AccessibilityService {
                 prefs.edit().putString(AppPrefs.LEARNED, value).apply();
             }
         });
-        memoryClear = memory::clear;
         hints = new AdHints(new AdHints.Store() {
             @Override public String read() {
                 return prefs.getString(AppPrefs.HINTS, "");
@@ -219,7 +228,6 @@ public final class AdSkipService extends AccessibilityService {
                 prefs.edit().putString(AppPrefs.HINTS, value).apply();
             }
         });
-        hintClear = hints::clear;
         feedback = new AdFeedback(new AdFeedback.Store() {
             @Override public String read() {
                 return prefs.getString(AppPrefs.FEEDBACK, "");
@@ -229,16 +237,14 @@ public final class AdSkipService extends AccessibilityService {
                 prefs.edit().putString(AppPrefs.FEEDBACK, value).apply();
             }
         });
-        feedbackClear = feedback::clear;
         actionLog = AppPrefs.actionLog(prefs);
-        forgetHook = signature -> {
-            if (memory != null) memory.remove(signature);
-            if (hints != null) hints.remove(signature);
-            if (feedback != null) feedback.forget(signature);
-        };
         reloadTaught();
         keyguard = getSystemService(KeyguardManager.class);
         power = getSystemService(PowerManager.class);
+        if (adMasks != null) adMasks.reset();
+        adMasks = new AdMaskController(this);
+        if (miniOcr != null) miniOcr.close();
+        miniOcr = new LiveMiniOcr(this);
         prefs.registerOnSharedPreferenceChangeListener(preferencesChanged);
         updatePackageFilter();
     }
@@ -248,43 +254,41 @@ public final class AdSkipService extends AccessibilityService {
         selection = AppPrefs.appSelection(prefs, java.util.Collections.emptySet());
         splashActive = prefs.getBoolean(AppPrefs.SPLASH_ACTIVE, true);
         inlineActive = prefs.getBoolean(AppPrefs.INLINE, false);
+        miniActive = prefs.getBoolean(AppPrefs.MINI_PROGRAM, true);
+        campusActive = prefs.getBoolean(AppPrefs.CAMPUS_ADS, true);
+        if (miniOcr != null && prefs.getBoolean(AppPrefs.ACTIVE, false) && miniActive
+                && (installed(MiniProgramRules.WECHAT) || installed(MiniProgramRules.ALIPAY))) miniOcr.warm();
         AccessibilityServiceInfo info = getServiceInfo();
         if (info == null) return;
         List<String> packages = new ArrayList<>();
         packages.add(getPackageName());
         if (prefs.getBoolean(AppPrefs.ACTIVE, false)) {
             for (String name : selection.selected()) {
-                if (!getPackageName().equals(name) && (splashAllowed(name) || inlineAllowed(name))) {
+                if (!getPackageName().equals(name) && (splashAllowed(name) || inlineAllowed(name)
+                        || miniAllowed(name) || campusAllowed(name))) {
                     packages.add(name);
                 }
             }
-        }
-        launcherPackage = "";
-        if (packages.stream().anyMatch(name -> !getPackageName().equals(name) && splashAllowed(name))) {
-            Intent home = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
-            ResolveInfo resolved = getPackageManager().resolveActivity(home, PackageManager.MATCH_DEFAULT_ONLY);
-            if (resolved != null && resolved.activityInfo != null) {
-                launcherPackage = resolved.activityInfo.packageName;
-                if (!packages.contains(launcherPackage)) packages.add(launcherPackage);
-                info.eventTypes |= AccessibilityEvent.TYPE_VIEW_CLICKED;
+            // The mini-app switch is self-contained: listen to both hosts even when the user never
+            // opened the splash tab. An explicit block still removes the host.
+            for (String host : new String[]{MiniProgramRules.WECHAT, MiniProgramRules.ALIPAY}) {
+                if (miniAllowed(host) && installed(host) && !packages.contains(host)) packages.add(host);
             }
-        } else {
-            info.eventTypes &= ~AccessibilityEvent.TYPE_VIEW_CLICKED;
         }
-        protectedPackages = packages.toArray(new String[0]);
-        info.packageNames = protectedPackages;
+        // Stay in the current foreground window. A package name does not identify a cloned profile.
+        android.util.Log.i("QingTapMini", "WeChat listening=" + packages.contains(MiniProgramRules.WECHAT));
+        info.packageNames = packages.toArray(new String[0]);
+        info.eventTypes |= AccessibilityEvent.TYPE_VIEW_CLICKED;
         info.eventTypes &= ~AccessibilityEvent.TYPE_WINDOWS_CHANGED;
         setServiceInfo(info);
-        if (!launcherPackage.isEmpty() && isForegroundPackage(launcherPackage)) setDesktopWatching(true);
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {
         if (prefs == null) return;
         String name = event.getPackageName() == null ? "" : event.getPackageName().toString();
         int type = event.getEventType();
-        trackLauncher(event, name, type);
         if (name.isEmpty() || type == AccessibilityEvent.TYPE_WINDOWS_CHANGED) return;
-        if (launcherPackage.equals(name) || getPackageName().equals(name) && DemoActivity.isTesting()) return;
+        if (getPackageName().equals(name) && DemoActivity.isTesting()) return;
         if (!isAllowed(name)) {
             if (name.equals(requestedPackage) || (name.equals(getPackageName())
                     && event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
@@ -292,19 +296,30 @@ public final class AdSkipService extends AccessibilityService {
             return;
         }
         boolean packageChanged = !name.equals(requestedPackage);
+        // Events from SDK virtual nodes may have no window ID. They cannot replace a verified window.
+        if (event.getWindowId() < 0) {
+            if (name.equals(requestedPackage)) scheduleScan(SCROLL_GAP_MS);
+            return;
+        }
         boolean windowChanged = requestedEventWindow != event.getWindowId();
+        if (MiniProgramRules.WECHAT.equals(name)) lastWeChatEventAt = SystemClock.uptimeMillis();
+        if ((packageChanged || windowChanged) && adMasks != null) adMasks.reset();
         requestedPackage = name;
         requestedEventWindow = event.getWindowId();
         boolean windowState = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+        String reported = event.getClassName() == null ? "" : event.getClassName().toString();
         if (type == AccessibilityEvent.TYPE_VIEW_CLICKED) {
             // A click in the splash window that we did not issue: the user closed it themselves, so the
             // window must not teach us anything.
             userClicked = true;
         }
+        if (windowState && MiniProgramRules.WECHAT.equals(name)) {
+            android.util.Log.d("QingTapMini", "WeChat window=" + event.getWindowId()
+                    + " mini=" + MiniProgramRules.context(name, reported));
+        }
         if (packageChanged) tencentStartupUntil = 0;
         if (windowState && TENCENT_VIDEO.equals(name)) {
-            if (TENCENT_SPLASH_ACTIVITY.contentEquals(
-                    event.getClassName() == null ? "" : event.getClassName())) {
+            if (TENCENT_SPLASH_ACTIVITY.contentEquals(reported)) {
                 tencentStartupWindow = event.getWindowId();
                 tencentStartupUntil = SystemClock.uptimeMillis() + TENCENT_STARTUP_MS;
             } else if (windowChanged) {
@@ -315,11 +330,22 @@ public final class AdSkipService extends AccessibilityService {
             clearLastTarget();
         }
         if (packageChanged || windowChanged) {
+            miniScope.leave();
             // The previous window is gone: if it was a splash we never acted on, it just taught us where
             // its skip control was.
             finishCloseTrace();
             closeSplash(SystemClock.uptimeMillis());
-            windowActivity = !windowState || event.getClassName() == null ? "" : event.getClassName().toString();
+            if (packageChanged) {
+                windowActivity = windowState || MiniProgramRules.host(name)
+                        && MiniProgramRules.context(name, reported) ? reported : "";
+            } else if (windowState) {
+                // A mini-app popup can be a new accessibility window with a framework class name.
+                // Keep the container activity in that case and only replace it on a real transition.
+                windowActivity = MiniProgramRules.host(name)
+                        ? MiniProgramRules.activityChange(name, windowActivity, reported, true) : reported;
+            } else if (!MiniProgramRules.host(name)) {
+                windowActivity = "";
+            }
             windowOpenedAt = SystemClock.uptimeMillis();
             learnedUsed = false;
             visionWindow = -1;
@@ -329,11 +355,18 @@ public final class AdSkipService extends AccessibilityService {
             sawCountdown = false;
             userClicked = false;
             resetTaughtProbes();
-        } else if (windowState && event.getClassName() != null) {
-            HomeLaunch.Route route = HomeLaunch.forPackage(name);
-            if (windowActivity.isEmpty() || route != null && route.launcherActivity.contentEquals(event.getClassName())) {
-                windowActivity = event.getClassName().toString();
+        } else if (windowState && !reported.isEmpty()) {
+            if (MiniProgramRules.context(name, reported)
+                    && (!reported.equals(windowActivity) || SystemClock.uptimeMillis() - windowOpenedAt > 20000)) {
+                miniScope.leave();
+                resetTaughtProbes();
+                windowOpenedAt = SystemClock.uptimeMillis();
+                userClicked = false;
             }
+            String nextActivity = MiniProgramRules.host(name)
+                    ? MiniProgramRules.activityChange(name, windowActivity, reported, true) : reported;
+            if (!nextActivity.equals(windowActivity)) miniScope.leave();
+            windowActivity = nextActivity;
         }
         if (packageChanged || (windowState
                 && (windowChanged || SystemClock.uptimeMillis() - lastProbeStart >= 240))) {
@@ -341,64 +374,6 @@ public final class AdSkipService extends AccessibilityService {
         } else {
             scheduleScan(type == AccessibilityEvent.TYPE_VIEW_SCROLLED ? SCROLL_GAP_MS : SCAN_GAP_MS);
         }
-    }
-
-    private void trackLauncher(AccessibilityEvent event, String name, int type) {
-        if (launcherPackage.isEmpty()) return;
-        boolean windowState = type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
-        boolean focusChanged = type == AccessibilityEvent.TYPE_WINDOWS_CHANGED && desktopWatching;
-        if (!windowState && !focusChanged) return;
-        if (focusChanged && Build.VERSION.SDK_INT >= 28
-                && (event.getWindowChanges() & (AccessibilityEvent.WINDOWS_CHANGE_FOCUSED
-                        | AccessibilityEvent.WINDOWS_CHANGE_ACTIVE)) == 0) return;
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
-        try {
-            CharSequence packageName = root.getPackageName();
-            if (packageName == null || !defaultDisplayWindow(root)) return;
-            String foreground = packageName.toString();
-            long now = SystemClock.uptimeMillis();
-            if (launcherPackage.equals(foreground)) {
-                if (windowState && launcherPackage.equals(name) && !desktopWatching) {
-                    homeLaunch.reset();
-                    homeDiscovery = null;
-                    setDesktopWatching(true);
-                }
-                return;
-            }
-            if (desktopWatching) {
-                setDesktopWatching(false);
-                if (!getPackageName().equals(foreground) && splashAllowed(foreground) && isAllowed(foreground)) {
-                    homeLaunch.fromDesktop(foreground, now);
-                    if (HomeLaunch.forPackage(foreground) == null) discoverHomeEntry(foreground, now);
-                }
-            }
-            if (homeDiscovery != null && !homeDiscovery.pkg.equals(foreground)) {
-                homeDiscovery = null;
-            }
-            if (windowState && foreground.equals(name) && root.getWindowId() == event.getWindowId()) {
-                String activity = event.getClassName() == null ? "" : event.getClassName().toString();
-                homeLaunch.windowChanged(name, activity, event.getWindowId(), now);
-                if (homeDiscovery != null) homeDiscovery.observe(activity, event.getWindowId());
-                if (homeEntryCheck != null && homeEntryCheck.route.isHomeWindow(name, activity)) {
-                    finishHomeCheck(AdActionLog.State.CHANGED, "发出请求后观察到应用首页");
-                }
-            }
-        } finally {
-            root.recycle();
-        }
-    }
-
-    private void setDesktopWatching(boolean watching) {
-        if (desktopWatching == watching) return;
-        desktopWatching = watching;
-        AccessibilityServiceInfo info = getServiceInfo();
-        if (info == null) return;
-        info.packageNames = watching ? null : protectedPackages;
-        if (watching) info.eventTypes |= AccessibilityEvent.TYPE_WINDOWS_CHANGED;
-        else info.eventTypes &= ~AccessibilityEvent.TYPE_WINDOWS_CHANGED;
-        setServiceInfo(info);
     }
 
     private boolean splashAllowed(String name) {
@@ -409,8 +384,28 @@ public final class AdSkipService extends AccessibilityService {
         return inlineActive && selection.inline.contains(name);
     }
 
+    // The mini-app switch owns the two host apps. An explicit block in the app list still wins, but
+    // the user no longer has to discover and tick WeChat/Alipay under the splash tab first.
+    private boolean miniAllowed(String name) {
+        return miniActive && MiniProgramRules.host(name) && !selection.blocked().contains(name);
+    }
+
+    private boolean campusAllowed(String name) {
+        return campusActive && CampusAdRules.PACKAGE.equals(name) && selection.inline.contains(name);
+    }
+
+    private boolean installed(String pkg) {
+        try {
+            getPackageManager().getApplicationInfo(pkg, 0);
+            return true;
+        } catch (PackageManager.NameNotFoundException absent) {
+            return false;
+        }
+    }
+
     private boolean isAllowed(String name) {
-        if (!prefs.getBoolean(AppPrefs.ACTIVE, false) || !(splashAllowed(name) || inlineAllowed(name))) return false;
+        if (!prefs.getBoolean(AppPrefs.ACTIVE, false) || !(splashAllowed(name) || inlineAllowed(name)
+                || miniAllowed(name) || campusAllowed(name))) return false;
         if (getPackageName().equals(name)) {
             return UnknownSplashActivity.showing;
         }
@@ -443,12 +438,19 @@ public final class AdSkipService extends AccessibilityService {
         scheduledAt = Long.MAX_VALUE;
         lastScan = SystemClock.uptimeMillis();
         String name = requestedPackage;
-        if (name == null || !isAllowed(name) || !safeDeviceState()) return;
+        if (name == null || !isAllowed(name) || !safeDeviceState()) {
+            if (adMasks != null) adMasks.clear();
+            return;
+        }
 
         AccessibilityNodeInfo root = activeRoot();
-        if (root == null) return;
+        if (root == null) {
+            if (adMasks != null) adMasks.clear();
+            return;
+        }
         List<AccessibilityNodeInfo> handles = new ArrayList<>();
         handles.add(root);
+        boolean masksUpdated = false;
         try {
             int windowId = root.getWindowId();
             RepeatGuard.Turn previousPage = repeatGuard.active();
@@ -457,17 +459,34 @@ public final class AdSkipService extends AccessibilityService {
                 repeatGuard.leave();
                 dismissRepeatPrompt();
             }
-            if (!matches(root, name, windowId)) return;
+            if (!matches(root, name, requestedEventWindow)) return;
             AdRules.Box viewport = applicationBounds(root);
             if (viewport == null) return;
-            boolean processSplash = splashAllowed(name);
-            String signature = AdMemory.signature(name, windowActivity, viewport.width(), viewport.height());
-            if (processSplash && waitForHomeEntry(root, name, windowId, signature)) return;
+            boolean miniHost = MiniProgramRules.host(name);
+            String rootClass = String.valueOf(root.getClassName());
+            if (miniHost && MiniProgramRules.context(name, rootClass)
+                    && !MiniProgramRules.context(name, windowActivity)) {
+                windowActivity = rootClass;
+                windowOpenedAt = SystemClock.uptimeMillis();
+                userClicked = false;
+                resetTaughtProbes();
+            }
+            boolean miniContainer = miniHost && MiniProgramRules.context(name, windowActivity);
+            // Do not walk every WeChat chat/alipay page now that the mini switch listens to both
+            // hosts. Only a container class or a mini-runtime root view justifies the node walk.
+            if (miniHost && !miniContainer
+                    && !MiniProgramRules.windowEvidence(name, rootClass, null)) return;
+            boolean processSplash = splashAllowed(name) && !miniHost;
 
             List<AdRules.Node> nodes = new ArrayList<>();
             nodes.add(snapshot(root, -1, viewport, false));
             boolean complete = collectChildren(handles, nodes, name, windowId, viewport,
                     SystemClock.uptimeMillis() + SCAN_BUDGET_MS);
+            // The activity transition is the normal proof. Root view/ids are only a fallback for a
+            // missed state change; the OCR path still needs its own badge and close text.
+            boolean miniRuntime = miniContainer
+                    || miniHost && MiniProgramRules.windowEvidence(name, rootClass, nodes);
+            String signature = pageSignature(name, miniRuntime, root, nodes, viewport);
             if (processSplash) detectCountdown(nodes);
             long sinceOpen = SystemClock.uptimeMillis() - windowOpenedAt;
             boolean damaiStartup = processSplash && DamaiSplash.startup(name, windowActivity, sinceOpen);
@@ -504,6 +523,43 @@ public final class AdSkipService extends AccessibilityService {
                 return;
             }
 
+            final ScopedAdRules.Match specialized = miniAllowed(name)
+                    ? MiniProgramRules.choose(name, miniContainer, nodes, viewport, complete)
+                    : campusAllowed(name) ? CampusAdRules.choose(name, windowActivity, nodes, viewport, complete) : null;
+            if (adMasks != null) {
+                boolean campus = campusAllowed(name)
+                        && !windowActivity.toLowerCase(java.util.Locale.ROOT).contains("reward");
+                CampusMaskAnchors.Result anchors = campus ? maskAnchors.read(root, windowId, viewport,
+                        nodes, complete, adMasks.activeIds()) : null;
+                List<CampusAdRules.Region> regions = campus
+                        ? CampusAdRules.regions(name, anchors.nodes, viewport, true) : java.util.Collections.emptyList();
+                if (specialized != null && !regions.isEmpty()) {
+                    AdRules.Box target = specialized.observed.box;
+                    float x = (target.left + target.right) / 2f, y = (target.top + target.bottom) / 2f;
+                    regions.removeIf(region -> x >= region.box.left && x < region.box.right
+                            && y >= region.box.top && y < region.box.bottom);
+                }
+                if (stillActive(name, windowId) && safeDeviceState()) {
+                    if (campus) adMasks.update(name, windowId, regions, anchors.checked);
+                    else if (!(MiniProgramRules.WECHAT.equals(name) && miniRuntime && miniAllowed(name)
+                            && !ScopedAdRules.blockedPage(nodes) && !focusedInput(root) && specialized == null))
+                        adMasks.clear();
+                } else adMasks.clear();
+                masksUpdated = true;
+                handler.removeCallbacks(maskRefresh);
+                if (campus) handler.postDelayed(maskRefresh, 220);
+                if (campus && adMasks.visible()) {
+                    sampleMaskBackground(name, windowId);
+                    String key = signature + "/" + windowId + "/" + adMasks.activeIds();
+                    if (!key.equals(maskedSignature) && actionLog != null) {
+                        actionLog.add(signature, "趣智校园广告遮挡", "广告区域 " + adMasks.activeIds().size() + " 类",
+                                System.currentTimeMillis(), "已原位覆盖广告区，长按可临时显示",
+                                AdActionLog.State.MASKED, "原位遮挡");
+                        maskedSignature = key;
+                    }
+                }
+            }
+
             boolean tencent = processSplash && TENCENT_VIDEO.equals(name);
             boolean startup = tencentStartupWindow == windowId && lastScan < tencentStartupUntil;
             boolean tencentContext = tencent && AdRules.tencentSplashContext(nodes, startup);
@@ -524,6 +580,11 @@ public final class AdSkipService extends AccessibilityService {
                 }
             }
             boolean damaiTap = damaiStartup && index >= 0;
+            if (index < 0 && specialized != null) index = specialized.index;
+            if (index < 0 && miniAllowed(name) && miniRuntime
+                    && !ScopedAdRules.blockedPage(nodes) && !focusedInput(root) && defaultDisplayWindow(root)) {
+                probeMiniAd(name, windowId, signature);
+            }
             AdRules.TaughtControl taughtControl = null;
             boolean learnedTap = false;
 
@@ -558,7 +619,7 @@ public final class AdSkipService extends AccessibilityService {
                 }
             }
 
-            if (!damaiStartup && index < 0) {
+            if (!damaiStartup && index < 0 && !miniHost) {
                 index = AdRules.choose(nodes, viewport, processSplash, inlineAllowed(name), complete);
             }
             if (index < 0 && !lessons.isEmpty() && complete && splashWindow && !userClicked
@@ -651,7 +712,7 @@ public final class AdSkipService extends AccessibilityService {
                 }
             }
 
-            boolean gestureTap = tencentTap || damaiTap || cornerTap || hintTap || learnedTap || taughtControl != null;
+            boolean gestureTap = specialized != null || tencentTap || damaiTap || cornerTap || hintTap || learnedTap || taughtControl != null;
             if (index < 0 && !damaiStartup && complete && !page && splashWindow && visionWindow != windowId
                     && AdRules.splashAdEvidence(nodes)
                     && SystemClock.uptimeMillis() - windowOpenedAt <= 6000 && ScreenVision.available()) {
@@ -664,7 +725,7 @@ public final class AdSkipService extends AccessibilityService {
                 return;
             }
 
-            String reason = damaiTap ? "大麦开屏规则" : taughtControl != null ? "教学规则 · 现场控件"
+            String reason = specialized != null ? specialized.rule : damaiTap ? "大麦开屏规则" : taughtControl != null ? "教学规则 · 现场控件"
                     : tencentTap ? "腾讯专项" : learnedTap ? "记住的位置" : hintTap ? "漏关学到的位置"
                     : structuralTap ? "开屏结构" : cornerTap ? "角落规则" : "通用规则";
             AccessibilityNodeInfo target = handles.get(index);
@@ -677,14 +738,16 @@ public final class AdSkipService extends AccessibilityService {
                 return;
             }
             AdRules.Node refreshed = snapshot(target, choice.parent, viewport, true);
-            boolean targetHolds = damaiTap ? AdRules.damaiSkipAt(refreshed, viewport)
+            boolean targetHolds = specialized != null ? specialized.matches(refreshed)
+                    : damaiTap ? AdRules.damaiSkipAt(refreshed, viewport)
                     : (hintTap || learnedTap || taughtControl != null)
                     ? refreshed.close > 0 && refreshed.box.isSmallControl(viewport)
                     : cornerTap
                     ? (structuralTap ? refreshed.splashEdgeIn(viewport) : refreshed.cornerSkipIn(viewport))
                     : refreshed.tencentSkipIn(viewport);
             boolean damaiResource = damaiTap && AdRules.DAMAI_SKIP_ID.equals(choice.id);
-            boolean sameTarget = damaiResource ? choice.id.equals(refreshed.id) && choice.sameBoxAs(refreshed)
+            boolean sameTarget = specialized != null ? specialized.matches(refreshed)
+                    : damaiResource ? choice.id.equals(refreshed.id) && choice.sameBoxAs(refreshed)
                     : hintTap || learnedTap ? choice.sameTarget(refreshed) : choice.sameSplashTarget(refreshed);
             if (gestureTap ? !sameTarget || !targetHolds
                     : !choice.sameControl(refreshed)) {
@@ -695,7 +758,7 @@ public final class AdSkipService extends AccessibilityService {
 
             RepeatGuard.Page identity = RepeatGuard.pageOf(name, String.valueOf(root.getClassName()),
                     nodes, viewport, null);
-            if (!beforeAutomaticClick(identity, windowId)) {
+            if (!beforeAutomaticClick(MiniScope.page(identity, signature), windowId)) {
                 noteGuard(signature, windowId, reason);
                 return;
             }
@@ -714,8 +777,9 @@ public final class AdSkipService extends AccessibilityService {
             TaughtTap tap = new TaughtTap(name, windowId, taughtControl == null ? null : taughtControl.lesson,
                     null, damaiTap);
             tap.control = refreshed;
+            tap.specialized = specialized;
             ClickMode mode = !gestureTap ? ClickMode.ACTION_ONLY
-                    : damaiTap || cornerTap || taughtControl != null ? ClickMode.ACTION_FIRST : ClickMode.TOUCH_FIRST;
+                    : specialized != null || damaiTap || cornerTap || taughtControl != null ? ClickMode.ACTION_FIRST : ClickMode.TOUCH_FIRST;
             boolean accepted = damaiResource ? clickDamaiResource(target, refreshed, viewport, tap)
                     : clickControl(target, refreshed, mode, tap);
             finishGuardedClick(accepted);
@@ -731,7 +795,7 @@ public final class AdSkipService extends AccessibilityService {
                 prefs.edit().putLong(AppPrefs.ACTIONS, count + 1).apply();
             }
             boolean trusted = feedback != null && feedback.allowed(signature);
-            if (accepted && processSplash && (splashWindow || trusted) && memory != null && learnable(name)) {
+            if (accepted && specialized == null && processSplash && (splashWindow || trusted) && memory != null && learnable(name)) {
                 double x = ((refreshed.box.left + refreshed.box.right) / 2.0 - viewport.left) / viewport.width();
                 double y = ((refreshed.box.top + refreshed.box.bottom) / 2.0 - viewport.top) / viewport.height();
                 memory.succeeded(signature, x, y,
@@ -746,8 +810,21 @@ public final class AdSkipService extends AccessibilityService {
             retry = clicks.waitTime(target, SystemClock.uptimeMillis());
             if ((!gestureTap || cornerTap) && retry > 0) scheduleRetry(retry);
         } finally {
+            if (!masksUpdated && adMasks != null) adMasks.clear();
             for (AccessibilityNodeInfo node : handles) node.recycle();
         }
+    }
+
+    private String pageSignature(String pkg, boolean mini, AccessibilityNodeInfo root,
+                                 List<AdRules.Node> nodes, AdRules.Box viewport) {
+        String scope = windowActivity;
+        if (mini) {
+            AccessibilityWindowInfo window = root.getWindow();
+            try {
+                scope = miniScope.identify(pkg, window == null ? null : window.getTitle(), nodes);
+            } finally { if (window != null) window.recycle(); }
+        }
+        return AdMemory.signature(pkg, scope, viewport.width(), viewport.height());
     }
 
     private WindowCloseTrace trace(String signature, int windowId) {
@@ -799,16 +876,20 @@ public final class AdSkipService extends AccessibilityService {
             if (previous != null) clearLastTarget();
             dismissRepeatPrompt();
         }
+        if (miniScope.locallyDenied(page)) return false;
         RepeatGuard.Decision decision = repeatGuard.decision(now, AppPrefs.repeatCount(prefs),
                 AppPrefs.repeatSeconds(prefs), AppPrefs.deniedPages(prefs));
         if (decision == RepeatGuard.Decision.ASK) {
             clearLastTarget();
             repeatPrompt = turn;
             boolean shown = AdPrompt.show(this, "同一页面反复出现，是广告吗？", appLabel(page.pkg)
-                    + " · 已暂停自动点击。选「不是」后会记住这个页面。", ad -> {
+                    + (page.layout.startsWith(MiniScope.WINDOW)
+                    ? " · 已暂停自动点击。选「不是」仅对本次窗口生效。"
+                    : " · 已暂停自动点击。选「不是」后会记住这个页面。"), ad -> {
                 repeatPrompt = null;
+                if (connected != this || repeatGuard.active() != turn) return;
                 if (!ad) {
-                    AppPrefs.setPageDenied(prefs, turn.page.encode(), true);
+                    if (!miniScope.denyLocally(turn.page)) AppPrefs.setPageDenied(prefs, turn.page.encode(), true);
                 } else if (repeatGuard.approve(turn)) {
                     onApproved.run();
                 }
@@ -927,7 +1008,7 @@ public final class AdSkipService extends AccessibilityService {
     private void dismissRepeatPrompt() {
         if (repeatPrompt == null) return;
         repeatPrompt = null;
-        AdPrompt.dismiss();
+        AdPrompt.dismiss(this);
     }
 
     private void askUser(String name, AdRules.Node candidate, AdRules.Box viewport, String signature) {
@@ -962,7 +1043,9 @@ public final class AdSkipService extends AccessibilityService {
     private enum ClickMode { ACTION_ONLY, ACTION_FIRST, TOUCH_FIRST }
 
     private boolean clickControl(AccessibilityNodeInfo target, AdRules.Node node, ClickMode mode, TaughtTap tap) {
-        float x = (node.box.left + node.box.right) / 2f;
+        float fraction = tap != null && tap.specialized != null && MiniProgramRules.host(tap.pkg)
+                ? MiniAdText.closeFraction(node.text.isEmpty() ? node.description : node.text) : .5f;
+        float x = node.box.left + node.box.width() * fraction;
         float y = (node.box.top + node.box.bottom) / 2f;
         if (mode == ClickMode.TOUCH_FIRST
                 && (tap == null ? tapAt(x, y) : dispatchTaughtGesture(x, y, tap, "控件中心"))) return true;
@@ -1082,9 +1165,17 @@ public final class AdSkipService extends AccessibilityService {
     // high contrast control in a corner. Only cornerwards candidates are accepted, and the tap is
     // verified afterwards: a hit teaches the memory so later launches skip the analysis entirely.
     private void resetTaughtProbes() {
+        handler.removeCallbacks(miniRetry);
         taughtGeneration++;
         taughtAttempts = 0;
         nextTaughtProbeAt = 0;
+        miniAttempts = 0;
+        lockerUntil = 0;
+        nextMiniAt = 0;
+        modalSeenAt = 0;
+        modalActed = false;
+        miniObserved = null;
+        miniObservedAt = 0;
     }
 
     // The user has already identified the ad in the teaching screenshot. Only its local image
@@ -1150,6 +1241,335 @@ public final class AdSkipService extends AccessibilityService {
         noteClose(signature, windowId, 2, rule, "获取画面", message, AdActionLog.State.UNKNOWN);
     }
 
+    private static final class CapturedFrame {
+        final ScreenshotFrame frame;
+        final int displayWidth, displayHeight;
+        CapturedFrame(ScreenshotFrame frame, int width, int height) {
+            this.frame = frame; displayWidth = width; displayHeight = height;
+        }
+    }
+
+    private static CapturedFrame captureFrame(ScreenshotResult screenshot, int maxWidth) {
+        try (HardwareBuffer buffer = screenshot.getHardwareBuffer()) {
+            Bitmap hardware = Bitmap.wrapHardwareBuffer(buffer, screenshot.getColorSpace());
+            if (hardware == null) return null;
+            Bitmap software = null;
+            try {
+                software = hardware.copy(Bitmap.Config.ARGB_8888, false);
+                return software == null ? null : new CapturedFrame(ScreenshotFrame.read(software, maxWidth),
+                        software.getWidth(), software.getHeight());
+            } finally {
+                if (software != null) software.recycle();
+                hardware.recycle();
+            }
+        } catch (RuntimeException unavailable) { return null; }
+    }
+
+    private void sampleMaskBackground(String name, int window) {
+        long now = SystemClock.uptimeMillis();
+        if (Build.VERSION.SDK_INT < 30 || maskCaptureBusy || now < nextMaskAt) return;
+        maskCaptureBusy = true;
+        nextMaskAt = now + 1200;
+        int generation = taughtGeneration;
+        long revision = adMasks.revision();
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, ForkJoinPool.commonPool(), new TakeScreenshotCallback() {
+                @Override public void onSuccess(ScreenshotResult screenshot) {
+                    CapturedFrame captured = captureFrame(screenshot, 540);
+                    handler.post(() -> {
+                        maskCaptureBusy = false;
+                        if (captured == null || generation != taughtGeneration || revision != adMasks.revision()
+                                || !safeDeviceState()
+                                || !campusAllowed(name) || !isAllowed(name) || !stillActive(name, window)) return;
+                        adMasks.colourFromFrame(captured.frame.pixels, captured.frame.width, captured.frame.height,
+                                captured.displayWidth, captured.displayHeight);
+                    });
+                }
+                @Override public void onFailure(int error) { handler.post(() -> maskCaptureBusy = false); }
+            });
+        } catch (RuntimeException unavailable) { maskCaptureBusy = false; }
+    }
+
+    private void probeMiniAd(String name, int window, String signature) {
+        long now = SystemClock.uptimeMillis();
+        // Accessibility takeScreenshot only. MediaProjection (“视觉兜底”) is deliberately not used
+        // here: OEM screen-recording grants are fragile and would turn this path into a prompt.
+        // No screenshot permission popup, relaunch, fixed point, or background application action.
+        boolean homeProbe = probeLockerHome(name, now);
+        boolean startup = !userClicked && miniAttempts < MINI_PROBE_LIMIT && now-windowOpenedAt <= 20000;
+        if (Build.VERSION.SDK_INT < 30 || miniOcr == null || miniBusy || now < nextMiniAt
+                || (!startup && !homeProbe)) return;
+        miniBusy = true;
+        miniAttempts++;
+        if (miniAttempts == 1) android.util.Log.d("QingTapMini", "starting mini-app screenshots");
+        nextMiniAt = now + (startup || lockerCardBox != null ? 650 : 1800);
+        int generation = taughtGeneration;
+        boolean windowFrame = Build.VERSION.SDK_INT >= 34 && lockerCardBox != null
+                && MiniProgramRules.WECHAT.equals(name);
+        try {
+            TakeScreenshotCallback callback = new TakeScreenshotCallback() {
+                @Override public void onSuccess(ScreenshotResult screenshot) {
+                    CapturedFrame captured = captureFrame(screenshot, 760);
+                    long capturedAt = now;
+                    if (captured == null) {
+                        android.util.Log.w("QingTapMini", "no readable screenshot");
+                        handler.post(AdSkipService.this::finishMiniProbe);
+                        return;
+                    }
+                    handler.post(() -> readMiniFrame(name, window, signature, generation, capturedAt, captured, windowFrame));
+                }
+                @Override public void onFailure(int error) {
+                    handler.post(() -> {
+                        android.util.Log.w("QingTapMini", "accessibility screenshot error=" + error);
+                        if (generation == taughtGeneration) noteClose(signature, window, 1,
+                                "小程序开屏 OCR", "获取画面", "系统未提供截图，错误码 " + error,
+                                AdActionLog.State.UNKNOWN);
+                        finishMiniProbe();
+                    });
+                }
+            };
+            if (windowFrame) takeScreenshotOfWindow(window, ForkJoinPool.commonPool(), callback);
+            else takeScreenshot(Display.DEFAULT_DISPLAY, ForkJoinPool.commonPool(), callback);
+        } catch (RuntimeException unavailable) { finishMiniProbe(); }
+    }
+
+    private void readMiniFrame(String name, int window, String signature, int generation,
+                               long capturedAt, CapturedFrame captured, boolean windowFrame) {
+        if (generation != taughtGeneration || !miniWindowCurrent(name, window)) {
+            android.util.Log.d("QingTapMini", "frame discarded: window or interaction changed");
+            finishMiniProbe();
+            return;
+        }
+        android.util.Log.d("QingTapMini", "sample " + miniAttempts + " age="
+                + (SystemClock.uptimeMillis() - capturedAt));
+        if (Build.VERSION.SDK_INT >= 34 && MiniProgramRules.WECHAT.equals(name) && miniOcr.card != null
+                && SystemClock.uptimeMillis()-capturedAt <= 1000 && updateLockerCard(name, window, captured, windowFrame)) {
+            finishMiniProbe();
+            return;
+        }
+        if (!windowFrame && MiniProgramRules.WECHAT.equals(name) && miniOcr.modal != null
+                && SystemClock.uptimeMillis()-capturedAt < 900) {
+            MiniProgramVision.Target modal = miniOcr.modal.locate(captured.frame);
+            if (modal != null) {
+                boolean confirmed = !modalActed && modalSeenAt > 0 && capturedAt-modalSeenAt < 2300
+                        && signature.equals(miniObservedSignature) && modal.confirms(miniObserved);
+                modalSeenAt = capturedAt;
+                miniObservedSignature = signature;
+                miniObserved = modal;
+                lastMiniResultAt = capturedAt;
+                nextMiniAt = capturedAt + 550;
+                if (confirmed) clickMiniAd(name, window, signature, generation, capturedAt, captured, modal);
+                finishMiniProbe();
+                return;
+            }
+            modalSeenAt = 0;
+            modalActed = false;
+        }
+        if (windowFrame || userClicked || miniAttempts > MINI_PROBE_LIMIT || capturedAt-windowOpenedAt > 20000) {
+            finishMiniProbe();
+            return;
+        }
+        LightCubeCover locker = miniOcr.locker;
+        if (MiniProgramRules.WECHAT.equals(name) && locker != null) {
+            if (locker.launchFrame(captured.frame)) {
+                lastMiniResultAt = capturedAt;
+                lockerUntil = capturedAt + 8000;
+                lockerLaunchSignature = signature;
+                miniObserved = null;
+                android.util.Log.d("QingTapMini", "locker launch recognized");
+                finishMiniProbe();
+                return;
+            }
+            if (capturedAt < lockerUntil && signature.equals(lockerLaunchSignature)) {
+                MiniProgramVision.Target countdown = locker.countdown(captured.frame);
+                if (countdown != null) {
+                    android.util.Log.d("QingTapMini", "locker countdown=" + countdown.lockerSeconds);
+                    acceptMiniFrame(name, window, signature, generation, capturedAt, captured, countdown);
+                    finishMiniProbe();
+                    return;
+                }
+            }
+        }
+        // Keep sampling even when the first OCR call is still loading its models.
+        // Only one full OCR job may be pending. Never let its older result overwrite a fresh count.
+        if (!miniOcrBusy) {
+            miniOcrBusy = true;
+            miniOcr.read(captured.frame, target -> handler.post(() -> {
+                miniOcrBusy = false;
+                if (capturedAt > lastMiniResultAt)
+                    acceptMiniFrame(name, window, signature, generation, capturedAt, captured, target);
+            }));
+        }
+        finishMiniProbe();
+    }
+
+    private void acceptMiniFrame(String name, int window, String signature, int generation,
+                                 long capturedAt, CapturedFrame captured, MiniProgramVision.Target target) {
+        long current = SystemClock.uptimeMillis();
+        if (generation == taughtGeneration && connected == this && capturedAt >= lastMiniResultAt) {
+            lastMiniResultAt = capturedAt;
+            if (miniContextCurrent(name, window) && current - capturedAt <= 1800 && target != null) {
+                boolean confirmed = signature.equals(miniObservedSignature) && target.confirms(miniObserved)
+                        && current - miniObservedAt < 3500;
+                if (!confirmed) noteClose(signature, window, 2, "小程序开屏识别", "识别",
+                        "已定位关闭文字，等待第二帧复核", AdActionLog.State.UNKNOWN);
+                miniObserved = target;
+                miniObservedSignature = signature;
+                miniObservedAt = current;
+                if (confirmed) {
+                    clickMiniAd(name, window, signature, generation, capturedAt, captured, target);
+                    miniObserved = null;
+                }
+            } else miniObserved = null;
+        }
+    }
+
+    private boolean probeLockerHome(String name, long now) {
+        return Build.VERSION.SDK_INT >= 34 && MiniProgramRules.WECHAT.equals(name) && miniOcr != null && miniOcr.card != null
+                && (lockerCardBox != null || (modalSeenAt > 0 && now-modalSeenAt < 2500 && !modalActed) || now-lastWeChatEventAt < 4500);
+    }
+
+    private boolean updateLockerCard(String name, int window, CapturedFrame captured, boolean windowFrame) {
+        if (adMasks == null) return false;
+        boolean visible = adMasks.activeIds().contains(LightCubeCard.ID);
+        ScreenshotFrame frame = captured.frame;
+        AdRules.Box slot = miniOcr.card.locate(frame);
+        if (slot == null) {
+            if (visible) adMasks.clear();
+            lockerCardBox = null;
+            return false;
+        }
+        AdRules.Box bounds = new AdRules.Box(slot.left * captured.displayWidth / frame.width,
+                slot.top * captured.displayHeight / frame.height,
+                (slot.right * captured.displayWidth + frame.width-1) / frame.width,
+                slot.bottom * captured.displayHeight / frame.height);
+        AccessibilityNodeInfo root = activeRoot();
+        if (root == null) return false;
+        try {
+            AdRules.Box viewport = applicationBounds(root);
+            if (windowFrame && viewport != null && captured.displayWidth == viewport.width()
+                    && captured.displayHeight == viewport.height()) {
+                bounds = new AdRules.Box(viewport.left+bounds.left, viewport.top+bounds.top,
+                        viewport.left+bounds.right, viewport.top+bounds.bottom);
+            } else {
+                AdRules.Box display = defaultDisplayBounds();
+                if (display == null || display.width() != captured.displayWidth || display.height() != captured.displayHeight) {
+                    expireLockerCard.run();
+                    return false;
+                }
+            }
+            if (!matches(root,name,window) || !defaultDisplayWindow(root) || focusedInput(root)
+                    || viewport == null || !viewport.contains(bounds)) {
+                expireLockerCard.run();
+                return false;
+            }
+        } finally { root.recycle(); }
+        adMasks.update(name, window, java.util.Collections.singletonList(
+                new CampusAdRules.Region(LightCubeCard.ID, bounds)), java.util.Collections.singleton(LightCubeCard.ID));
+        lockerCardBox = adMasks.visible() ? slot : null;
+        handler.removeCallbacks(expireLockerCard);
+        if (lockerCardBox != null) {
+            handler.postDelayed(expireLockerCard, 2200);
+            if (!visible) android.util.Log.i("QingTapMini", "pickup card covered " + bounds.left + ","
+                    + bounds.top + "-" + bounds.right + "," + bounds.bottom);
+        }
+        return true;
+    }
+
+    private void finishMiniProbe() {
+        miniBusy = false;
+        long now = SystemClock.uptimeMillis();
+        if (connected == this && requestedPackage != null && miniAllowed(requestedPackage)
+                && ((miniAttempts < MINI_PROBE_LIMIT && now-windowOpenedAt < 20000)
+                || probeLockerHome(requestedPackage, now))) {
+            handler.removeCallbacks(miniRetry);
+            handler.postDelayed(miniRetry, Math.max(120, nextMiniAt - SystemClock.uptimeMillis()));
+        }
+    }
+
+    private boolean miniContextCurrent(String name, int window) {
+        return !userClicked && miniWindowCurrent(name, window);
+    }
+
+    private boolean miniWindowCurrent(String name, int window) {
+        if (!(connected == this && name.equals(requestedPackage) && requestedEventWindow == window
+                && isAllowed(name) && miniAllowed(name) && safeDeviceState()
+                && repeatPrompt == null)) return false;
+        AccessibilityNodeInfo root = activeRoot();
+        if (root == null) return false;
+        try {
+            return matches(root, name, window)
+                    && MiniProgramRules.runtime(name, windowActivity,
+                    String.valueOf(root.getClassName()), null);
+        } finally {
+            root.recycle();
+        }
+    }
+
+    private boolean miniTapCurrent(String name, int window, MiniProgramVision.Target target) {
+        return target.lockerModal ? miniWindowCurrent(name, window) : miniContextCurrent(name, window);
+    }
+
+    private void clickMiniAd(String name, int window, String signature, int generation, long capturedAt,
+                             CapturedFrame captured, MiniProgramVision.Target target) {
+        if (generation != taughtGeneration || !miniTapCurrent(name, window, target)
+                || SystemClock.uptimeMillis() - capturedAt > 1800
+                || feedback != null && feedback.denied(signature)) return;
+        AccessibilityNodeInfo root = activeRoot();
+        if (root == null) return;
+        List<AccessibilityNodeInfo> handles = new ArrayList<>(); handles.add(root);
+        try {
+            if (!matches(root, name, window) || !defaultDisplayWindow(root) || focusedInput(root)) return;
+            AdRules.Box viewport = applicationBounds(root);
+            if (viewport == null) return;
+            AdRules.Box display = defaultDisplayBounds();
+            if (display == null || display.width() != captured.displayWidth
+                    || display.height() != captured.displayHeight) return;
+            float x = target.x * captured.displayWidth, y = target.y * captured.displayHeight;
+            if (x < viewport.left || x >= viewport.right || y < viewport.top || y >= viewport.bottom) return;
+            List<AdRules.Node> nodes = new ArrayList<>(); nodes.add(snapshot(root, -1, viewport, false));
+            // Canvas ads often have no text nodes. A slow/partial tree is not itself a reason to skip:
+            // the two-frame OCR evidence already proved the ad, and blockedPage() still vetoes payment
+            // and authorization pages before the gesture is dispatched.
+            collectChildren(handles, nodes, name, window, viewport, SystemClock.uptimeMillis() + 90);
+            if (ScopedAdRules.blockedPage(nodes) || !miniTapCurrent(name, window, target)) return;
+            String live = pageSignature(name, true, root, nodes, viewport);
+            if (!live.equals(signature)) {
+                android.util.Log.d("QingTapMini", "tap discarded: feedback scope changed");
+                return;
+            }
+            if (target.lockerSeconds >= 0 || target.lockerModal) {
+                String scope = MiniScope.segment(live);
+                if (scope.startsWith(MiniScope.NAMED) && !scope.equals(MiniScope.LOCKER)) return;
+                signature = AdMemory.signature(name, MiniScope.LOCKER, viewport.width(), viewport.height());
+                if (feedback != null && feedback.denied(signature)) return;
+            }
+            SceneFingerprint scene = captured.frame.scene();
+            RepeatGuard.Page page = RepeatGuard.pageOf(name, String.valueOf(root.getClassName()),
+                    nodes, viewport, scene);
+            if (!beforeAutomaticClick(MiniScope.page(page, signature), window)) return;
+            TaughtTap tap = new TaughtTap(name, window, null, scene, false);
+            tap.attempted = true;
+            if (!miniTapCurrent(name, window, target) || SystemClock.uptimeMillis() - capturedAt > 1800) return;
+            boolean locker = target.lockerSeconds >= 0;
+            boolean accepted = dispatchTaughtGesture(x, y, tap, target.lockerModal ? "光启立方商品插屏关闭" : locker ? "光启立方倒计时关闭" : "两帧 OCR 关闭文字");
+            if (locker) android.util.Log.i("QingTapMini", "locker gesture accepted=" + accepted
+                    + " seconds=" + target.lockerSeconds);
+            if (target.lockerModal) {
+                modalActed = accepted;
+                android.util.Log.i("QingTapMini", "product modal gesture accepted=" + accepted);
+            }
+            finishGuardedClick(accepted);
+            recordTaughtTap(signature, target.lockerModal ? "光启立方商品插屏" : locker ? "光启立方开屏倒计时" : name.equals(MiniProgramRules.WECHAT)
+                    ? "微信小程序开屏 OCR" : "支付宝小程序开屏 OCR", target.label, tap, accepted);
+            if (accepted) {
+                lockerUntil = 0;
+                acted = true;
+                prefs.edit().putLong(AppPrefs.ACTIONS, prefs.getLong(AppPrefs.ACTIONS, 0) + 1).apply();
+            }
+        } finally { for (AccessibilityNodeInfo node : handles) node.recycle(); }
+    }
+
     private static final class TaughtTap {
         final String pkg;
         final int window;
@@ -1157,6 +1577,7 @@ public final class AdSkipService extends AccessibilityService {
         final SceneFingerprint scene;
         final boolean damai;
         AdRules.Node control;
+        ScopedAdRules.Match specialized;
         String logId;
         String action = "";
         String verification = "";
@@ -1241,143 +1662,6 @@ public final class AdSkipService extends AccessibilityService {
             android.util.Log.i("QingTapDamai", "action " + reason + " " + label + " " + tap.action);
         }
         if (accepted) handler.postDelayed(() -> verifyTaughtTap(tap), 700);
-    }
-
-    private static final class HomeEntryCheck {
-        final HomeLaunch.Route route;
-        final String logId;
-
-        HomeEntryCheck(HomeLaunch.Route route, String logId) {
-            this.route = route;
-            this.logId = logId;
-        }
-    }
-
-    private void discoverHomeEntry(String name, long now) {
-        HomeLaunch.Discovery discovery = new HomeLaunch.Discovery(name, now);
-        homeDiscovery = discovery;
-        ForkJoinPool.commonPool().execute(() -> {
-            HomeEntryFinder.Result result = HomeEntryFinder.find(getPackageManager(), name);
-            handler.post(() -> {
-                if (homeDiscovery != discovery) return;
-                discovery.resolved(result.launcherActivities, result.uri, result.destination);
-                if (name.equals(requestedPackage)) scheduleScan(0);
-            });
-        });
-    }
-
-    private boolean waitForHomeEntry(AccessibilityNodeInfo root, String name, int windowId, String signature) {
-        long now = SystemClock.uptimeMillis();
-        long wait = homeLaunch.waitRemaining(name, windowId, now);
-        if (wait == 0) wait = homeLaunch.startupWait(name, now);
-        HomeLaunch.Discovery discovery = homeDiscovery;
-        boolean discovering = discovery != null && discovery.pkg.equals(name);
-        if (wait == 0 && discovering) wait = discovery.waitRemaining(now);
-        if (wait > 0) {
-            scheduleScan(wait);
-            return true;
-        }
-
-        HomeLaunch.Route route;
-        if (discovering) {
-            homeDiscovery = null;
-            route = discovery.route(windowId, now);
-            if (route == null) {
-                String detail = !discovery.resolved() ? "首页入口检查超时"
-                        : discovery.hasEntry() ? "没有确认对应的桌面启动窗口" : "没有找到可安全调用的公开首页入口";
-                writeHomeLog(signature, "", AdActionLog.State.SKIPPED, "检查入口",
-                        detail + "，继续识别广告");
-                return false;
-            }
-        } else {
-            route = homeLaunch.take(name, windowId, now);
-            if (route == null) {
-                noteMissingDesktopLaunch(name, windowId, signature);
-                return false;
-            }
-        }
-
-        if (userClicked || repeatPrompt != null || !defaultDisplayWindow(root)) {
-            recordHome(route, windowId, signature, AdActionLog.State.BLOCKED, "启动来源",
-                    "当前窗口或用户操作不适合跳转，继续按广告规则处理");
-            return false;
-        }
-        if (!requestHomeEntry(route, windowId, signature)) return false;
-        homeLaunch.requested(route, windowId, SystemClock.uptimeMillis());
-        scheduleScan(homeLaunch.waitRemaining(name, windowId, SystemClock.uptimeMillis()));
-        return true;
-    }
-
-    private void noteMissingDesktopLaunch(String name, int windowId, String signature) {
-        if (windowId == lastHomeLogWindow && name.equals(lastHomeLogPackage)) return;
-        HomeLaunch.Route route = HomeLaunch.forPackage(name);
-        if (route != null && route.hasDistinctHome() && route.launcherActivity.equals(windowActivity)) {
-            recordHome(route, windowId, signature, AdActionLog.State.UNKNOWN, "启动来源",
-                    "未同时确认桌面启动与启动窗口，继续按广告规则处理");
-        }
-    }
-
-    private String recordHome(HomeLaunch.Route route, int windowId, String signature, AdActionLog.State state,
-                              String stage, String detail) {
-        lastHomeLogWindow = windowId;
-        lastHomeLogPackage = route.pkg;
-        return writeHomeLog(signature, route.uri, state, stage, detail);
-    }
-
-    private String writeHomeLog(String signature, String uri, AdActionLog.State state, String stage, String detail) {
-        return actionLog == null ? "" : actionLog.add(signature, HOME_RULE, uri,
-                System.currentTimeMillis(), detail, state, stage);
-    }
-
-    private void finishHomeCheck(AdActionLog.State state, String detail) {
-        HomeEntryCheck check = homeEntryCheck;
-        if (check == null) return;
-        homeEntryCheck = null;
-        handler.removeCallbacks(homeCheckTimeout);
-        if (actionLog != null) {
-            actionLog.update(check.logId, null, null, detail, state, "首页核对");
-        }
-    }
-
-    private boolean requestHomeEntry(HomeLaunch.Route route, int windowId, String signature) {
-        Intent home = new Intent(Intent.ACTION_VIEW, Uri.parse(route.uri))
-                .setPackage(route.pkg)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        ResolveInfo resolved = getPackageManager().resolveActivity(home, PackageManager.MATCH_DEFAULT_ONLY);
-        if (resolved == null || resolved.activityInfo == null || !resolved.activityInfo.exported
-                || !route.pkg.equals(resolved.activityInfo.packageName)
-                || !route.destination.equals(resolved.activityInfo.name)) {
-            recordHome(route, windowId, signature, AdActionLog.State.FAILED, "解析入口",
-                    "当前版本没有匹配的可用首页入口，继续按广告规则处理");
-            android.util.Log.i(HOME_LOG, route.pkg + " homepage unavailable; scanning current screen");
-            return false;
-        }
-        if (!stillActive(route.pkg, windowId)) {
-            recordHome(route, windowId, signature, AdActionLog.State.BLOCKED, "发起请求",
-                    "发起首页请求前，原启动窗口已切换");
-            return false;
-        }
-        try {
-            startActivity(home.setClassName(route.pkg, route.destination));
-            android.util.Log.i(HOME_LOG, route.pkg + " requested " + route.destination);
-            finishHomeCheck(AdActionLog.State.UNKNOWN, "新启动已开始，前一次首页未核对");
-            if (route.hasDistinctHome()) {
-                String logId = recordHome(route, windowId, signature, AdActionLog.State.CHECKING, "发起请求",
-                        "已发送首页请求，等待核对");
-                homeEntryCheck = new HomeEntryCheck(route, logId);
-                handler.postDelayed(homeCheckTimeout, HOME_CHECK_MS);
-            } else {
-                recordHome(route, windowId, signature, AdActionLog.State.UNKNOWN, "发起请求",
-                        route.homeActivity.isEmpty() ? "已发送公开首页请求，继续检查当前画面"
-                                : "已发送首页请求，开屏与首页共用窗口，继续按广告规则检查画面");
-            }
-            return true;
-        } catch (ActivityNotFoundException | SecurityException unavailable) {
-            recordHome(route, windowId, signature, AdActionLog.State.FAILED, "发起请求",
-                    "系统未接受首页请求，继续按广告规则处理");
-            android.util.Log.i(HOME_LOG, route.pkg + " homepage request rejected; scanning current screen");
-            return false;
-        }
     }
 
     private boolean clickVisualTarget(String signature, String rule, String label, long started,
@@ -1655,7 +1939,7 @@ public final class AdSkipService extends AccessibilityService {
                     SystemClock.uptimeMillis() + 45);
             if (!verifySameWindow(tap)) return;
             for (AdRules.Node node : nodes) {
-                if (!tap.control.sameSplashTarget(node)) continue;
+                if (!(tap.specialized != null ? tap.specialized.matches(node) : tap.control.sameSplashTarget(node))) continue;
                 updateTaughtTap(tap, AdActionLog.State.FAILED, "点击后同一关闭控件仍在");
                 if (taught != null) taught.missed(tap.lesson);
                 return;
@@ -1800,10 +2084,34 @@ public final class AdSkipService extends AccessibilityService {
     }
 
     private AccessibilityNodeInfo activeRoot() {
-        if (Build.VERSION.SDK_INT >= 33) {
-            return getRootInActiveWindow(AccessibilityNodeInfo.FLAG_PREFETCH_DESCENDANTS_BREADTH_FIRST);
+        AccessibilityNodeInfo root = Build.VERSION.SDK_INT >= 33
+                ? getRootInActiveWindow(AccessibilityNodeInfo.FLAG_PREFETCH_DESCENDANTS_BREADTH_FIRST)
+                : getRootInActiveWindow();
+        if (root != null) {
+            AccessibilityWindowInfo window = root.getWindow();
+            try {
+                if (window != null && window.getType() == AccessibilityWindowInfo.TYPE_APPLICATION) return root;
+            } finally { if (window != null) window.recycle(); }
+            root.recycle();
         }
-        return getRootInActiveWindow();
+        // No fallback by package alone: cloned profiles have identical package names.
+        List<AccessibilityWindowInfo> windows = getWindows();
+        AccessibilityNodeInfo selected = null;
+        try {
+            for (AccessibilityWindowInfo window : windows) {
+                if (window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION
+                        || (!window.isFocused() && !window.isActive())) continue;
+                AccessibilityNodeInfo candidate = window.getRoot();
+                if (candidate == null) continue;
+                if (matches(candidate, requestedPackage, requestedEventWindow)) {
+                    selected = candidate; break;
+                }
+                candidate.recycle();
+                // A different focused application is authoritative, including a different cloned window.
+                if (window.isFocused()) break;
+            }
+        } finally { for (AccessibilityWindowInfo window : windows) window.recycle(); }
+        return selected;
     }
 
     private boolean collectChildren(List<AccessibilityNodeInfo> handles, List<AdRules.Node> nodes,
@@ -1880,7 +2188,10 @@ public final class AdSkipService extends AccessibilityService {
         }
         if (label == null || countdown == null) return label;
         String combined = countdown + " " + label;
-        return AdRules.isCloseLabel(combined) ? combined : null;
+        // WeChat cover ads use “4秒 | 关闭”, while the generic AdRules vocabulary only knows
+        // “跳过 4”. Accept both here so a clickable close container exposed as two children is
+        // still handled without relying on a screenshot.
+        return AdRules.isCloseLabel(combined) || MiniAdText.countdownClose(combined) ? combined : null;
     }
 
     private static boolean empty(CharSequence value) {
@@ -1913,8 +2224,7 @@ public final class AdSkipService extends AccessibilityService {
     }
 
     private boolean stillActive(String name, int windowId) {
-        AccessibilityNodeInfo current = Build.VERSION.SDK_INT >= 33 ? getRootInActiveWindow(0)
-                : getRootInActiveWindow();
+        AccessibilityNodeInfo current = activeRoot();
         if (current == null) return false;
         try {
             return matches(current, name, windowId);
@@ -1927,15 +2237,19 @@ public final class AdSkipService extends AccessibilityService {
         AccessibilityNodeInfo current = getRootInActiveWindow();
         if (current == null) return false;
         try {
-            return current.getPackageName() != null && name.contentEquals(current.getPackageName());
+            AccessibilityWindowInfo window = current.getWindow();
+            try {
+                return window != null && window.getType() == AccessibilityWindowInfo.TYPE_APPLICATION
+                        && (window.isActive() || window.isFocused()) && current.getPackageName() != null
+                        && name.contentEquals(current.getPackageName());
+            } finally { if (window != null) window.recycle(); }
         } finally {
             current.recycle();
         }
     }
 
     private static boolean matches(AccessibilityNodeInfo node, String name, int windowId) {
-        return node.getWindowId() == windowId && node.getPackageName() != null
-                && name.contentEquals(node.getPackageName());
+        return WindowIdentity.matches(name, windowId, node.getPackageName(), node.getWindowId());
     }
 
     private boolean safeDeviceState() {
@@ -1955,6 +2269,11 @@ public final class AdSkipService extends AccessibilityService {
     }
 
     private void clearPending() {
+        handler.removeCallbacks(maskRefresh);
+        handler.removeCallbacks(expireLockerCard);
+        lockerCardBox = null;
+        if (adMasks != null) adMasks.reset();
+        maskedSignature = "";
         finishCloseTrace();
         closeSplash(SystemClock.uptimeMillis());
         handler.removeCallbacks(scan);
@@ -1974,13 +2293,8 @@ public final class AdSkipService extends AccessibilityService {
         sawCountdown = false;
         requestedPackage = null;
         requestedEventWindow = -1;
-        homeLaunch.reset();
-        homeDiscovery = null;
-        finishHomeCheck(AdActionLog.State.UNKNOWN, "核对首页前，前台窗口或服务状态已切换");
-        lastHomeLogWindow = -1;
-        lastHomeLogPackage = "";
-        setDesktopWatching(false);
         tencentStartupUntil = 0;
+        miniScope.leave();
         windowActivity = "";
         ticking = false;
         lastCount = -1;
@@ -1994,9 +2308,10 @@ public final class AdSkipService extends AccessibilityService {
     }
 
     @Override public void onDestroy() {
-        AdPrompt.dismiss();
+        AdPrompt.dismiss(this);
         if (connected == this) connected = null;
         clearPending();
+        if (miniOcr != null) miniOcr.close();
         if (prefs != null) prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged);
         super.onDestroy();
     }

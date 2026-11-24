@@ -41,9 +41,10 @@ final class AdFeedback {
     // A lesson taught from a screenshot is stored as "pkg/*" so it covers every screen of that app; an
     // exact signature always wins over the app wide entry.
     private Integer lookup(String signature) {
+        if (signature != null && MiniScope.segment(signature).startsWith(MiniScope.WINDOW)) return null;
         Integer exact = verdicts.get(signature);
         if (exact != null) return exact;
-        if (signature == null) return null;
+        if (signature == null || MiniScope.scoped(signature)) return null;
         int slash = signature.indexOf('/');
         if (slash <= 0) return null;
         return verdicts.get(signature.substring(0, slash) + "/*");
@@ -112,6 +113,7 @@ final class AdFeedback {
 
     private void set(String signature, int verdict) {
         load();
+        if (MiniScope.segment(signature).startsWith(MiniScope.WINDOW)) return;
         verdicts.remove(signature);
         verdicts.put(signature, verdict);
         while (verdicts.size() > LIMIT) {

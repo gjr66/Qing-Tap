@@ -18,6 +18,8 @@ final class AppPrefs {
     static final String SPLASH_ACTIVE = "splash_active";
     static final String ACTIVE = "active";
     static final String INLINE = "inline";
+    static final String MINI_PROGRAM = "mini_program_ads";
+    static final String CAMPUS_ADS = "campus_ad_optimization";
     static final String ACTIONS = "clicks_accepted";
     static final String LEARNED = "learned_targets";
     static final String HINTS = "splash_hints";

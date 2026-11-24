@@ -6,6 +6,7 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -54,6 +55,8 @@ public final class MainActivity extends Activity {
         Ui.add(this, stateCard, serviceState, 0);
         Ui.add(this, stateCard, Ui.text(this,
                 "Android 无障碍服务启用后，清弹会在设备上识别当前窗口里的广告关闭按钮。", 14, Ui.MUTED, false), 8);
+        Ui.add(this, stateCard, Ui.text(this,
+                "分身保护：留在当前应用窗口处理，不再自动跳转首页或重新打开应用。", 13, Ui.MUTED, false), 6);
         Ui.add(this, stateCard, Ui.button(this, "打开系统无障碍设置", true, view -> disclose()), 14);
 
         LinearLayout options = card(body, 14);
@@ -95,6 +98,30 @@ public final class MainActivity extends Activity {
         Ui.add(this, options, inline, 12);
         Ui.add(this, options, Ui.text(this,
                 "适用于带广告标识和独立关闭入口的部分评论区、信息流和横幅广告。", 14, Ui.MUTED, false), 3);
+        Switch mini = new Switch(this);
+        mini.setText("处理微信 / 支付宝小程序广告");
+        mini.setTextSize(16);
+        mini.setTextColor(Ui.INK);
+        mini.setMinHeight(Ui.dp(this, 44));
+        mini.setChecked(prefs.getBoolean(AppPrefs.MINI_PROGRAM, true));
+        mini.setOnCheckedChangeListener((button, checked) ->
+                prefs.edit().putBoolean(AppPrefs.MINI_PROGRAM, checked).apply());
+        Ui.add(this, options, mini, 12);
+        Ui.add(this, options, Ui.text(this,
+                "开启后处理微信和支付宝中的小程序页面，无需在开屏名单里另选这两个宿主；名单中明确屏蔽的宿主仍不处理。使用无障碍截图识别开屏广告，可关闭光启立方的商品插屏，并遮挡取件页底部广告卡。长按遮挡处可临时显示。", 13, Ui.MUTED, false), 3);
+        Ui.add(this, options, Ui.button(this, "小程序域名过滤（试验）", false,
+                view -> startActivity(new Intent(this, DnsFilterActivity.class))), 8);
+        Switch campus = new Switch(this);
+        campus.setText("趣智校园专项优化");
+        campus.setTextSize(16);
+        campus.setTextColor(Ui.INK);
+        campus.setMinHeight(Ui.dp(this, 44));
+        campus.setChecked(prefs.getBoolean(AppPrefs.CAMPUS_ADS, true));
+        campus.setOnCheckedChangeListener((button, checked) ->
+                prefs.edit().putBoolean(AppPrefs.CAMPUS_ADS, checked).apply());
+        Ui.add(this, options, campus, 12);
+        Ui.add(this, options, Ui.text(this,
+                "需在内嵌名单中启用趣智校园，无需打开全局内嵌开关。广告区用周围背景色遮挡，长按可临时显示。", 13, Ui.MUTED, false), 3);
         TextView repeatSummary = Ui.text(this, repeatSummary(), 13, Ui.MUTED, false);
         Ui.add(this, options, Ui.button(this, "设置重复出现保护", false, view -> configureRepeat(repeatSummary)), 12);
         Ui.add(this, options, repeatSummary, 4);
@@ -175,8 +202,17 @@ public final class MainActivity extends Activity {
                 view -> startActivity(new Intent(this, TeachActivity.class))), 10);
         Ui.add(this, demo, Ui.button(this, "查看学习记录", false,
                 view -> startActivity(new Intent(this, LearningActivity.class))), 10);
-        Ui.add(this, body, Ui.text(this, "无障碍模式 · 离线运行 · Android 8.0 及以上 · v2.0 r50",
+        Ui.add(this, body, Ui.text(this, "无障碍识别在本机运行 · Android 8.0 及以上 · v" + versionLabel(),
                 13, Ui.MUTED, false), 18);
+    }
+
+    private String versionLabel() {
+        try {
+            String name = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            return name == null ? "2.0" : name.replace('-', ' ');
+        } catch (PackageManager.NameNotFoundException missing) {
+            return "2.0";
+        }
     }
 
     private String repeatSummary() {

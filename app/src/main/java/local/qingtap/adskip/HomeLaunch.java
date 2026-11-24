@@ -3,6 +3,8 @@ package local.qingtap.adskip;
 import java.util.Set;
 import java.util.regex.Pattern;
 
+// Historical route helpers retained for compatibility tests. Since r51 the accessibility service
+// does not invoke them: external home intents lose cloned-profile identity.
 // Consume the first app transition from the desktop. A re-entry caused by our own request
 // cannot create another candidate, even when its destination is the same startup activity.
 final class HomeLaunch {

@@ -95,6 +95,10 @@ final class AdPrompt {
         return true;
     }
 
+    static void dismiss(Context owner) {
+        if (current != null && current.getContext() == owner) dismiss();
+    }
+
     static void dismiss() {
         Runnable pending = timeout;
         timeout = null;
